@@ -1,0 +1,6 @@
+# Десктоп-приложение (python main.py): всё серверное плюс интерфейс.
+-r requirements_server.txt
+PyQt5==5.15.11
+matplotlib==3.10.7
+# Необязательно: парсер новостей через браузер (ollama_worker.NewsParser)
+playwright==1.56.0

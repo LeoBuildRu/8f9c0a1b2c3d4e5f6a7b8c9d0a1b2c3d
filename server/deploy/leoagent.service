@@ -1,0 +1,31 @@
+[Unit]
+Description=LeoAgent — autonomous MOEX trading agent + Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=leoagent
+Group=leoagent
+WorkingDirectory=/opt/leoagent
+EnvironmentFile=/etc/leoagent.env
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/leoagent/.venv/bin/python -m server.main
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# На маленьком VPS рядом живут другие сервисы (VPN): если агент разрастётся,
+# systemd убьёт и перезапустит только его.
+MemoryMax=600M
+
+# Изоляция и безопасность
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/leoagent/data /var/log/leoagent
+
+[Install]
+WantedBy=multi-user.target

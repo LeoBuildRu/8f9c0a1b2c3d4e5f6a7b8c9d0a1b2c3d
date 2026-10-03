@@ -1,0 +1,27 @@
+[Unit]
+Description=LeoAgent dashboard — read-only web UI on 127.0.0.1:8765 (open via SSH tunnel)
+After=network-online.target leoagent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=leoagent
+Group=leoagent
+WorkingDirectory=/opt/leoagent
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/leoagent/.venv/bin/python -m server.dashboard
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+MemoryMax=300M
+
+# Изоляция: пишет только точки кривой капитала в data/
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/leoagent/data
+
+[Install]
+WantedBy=multi-user.target

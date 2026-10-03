@@ -1,0 +1,11 @@
+# Версии аналитических библиотек закреплены: на них проверены агент и backtest.py.
+# pandas-ta 0.4.x требует Python 3.12+ (старая 0.3.14b не работает с numpy 2).
+requests[socks]==2.32.5
+beautifulsoup4==4.14.2
+pandas==2.3.3
+numpy==2.2.6
+pandas-ta==0.4.71b0
+scikit-learn==1.7.2
+fake-useragent==2.2.0
+python-telegram-bot[socks]==20.7
+httpx[socks]==0.25.2

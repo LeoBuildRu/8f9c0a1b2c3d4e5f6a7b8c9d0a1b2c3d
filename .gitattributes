@@ -1,0 +1,11 @@
+# Текст хранится в репозитории с LF
+* text=auto
+
+# Уезжает на Linux-сервер: всегда LF, иначе bash и systemd спотыкаются о \r
+*.sh text eol=lf
+*.service text eol=lf
+*.env.example text eol=lf
+
+# Запускается в Windows
+*.bat text eol=crlf
+*.ps1 text eol=crlf
