@@ -298,6 +298,7 @@ body.offline .data { opacity: .55; transition: opacity .2s; }
     <div class="pills">
       <span class="pill" id="pill-agent"><span class="dot"></span><span>Подключение…</span></span>
       <span class="pill" id="pill-session"><span class="dot"></span><span>—</span></span>
+      <span class="pill" id="pill-model" hidden><span class="dot accent"></span><span>—</span></span>
       <span class="pill" id="pill-link" hidden><span class="dot down"></span><span>Нет связи с сервером — туннель закрыт?</span></span>
     </div>
     <div class="market data" id="market"></div>
@@ -316,6 +317,7 @@ body.offline .data { opacity: .55; transition: opacity .2s; }
       <div class="hero-sub">
         <span><span id="equity-delta" class="delta flat">—</span> <span class="muted">с начала</span></span>
         <span><span id="today-delta" class="delta flat">—</span> <span class="muted">сегодня</span></span>
+        <span title="Свободные деньги считаются лежащими в фонде денежного рынка LQDT"><span id="cash-yield" class="delta flat">—</span> <span class="muted">доход на свободных деньгах</span></span>
       </div>
     </div>
     <div class="card tile">
@@ -871,6 +873,7 @@ async function refreshState() {
   setDelta($('#equity-delta'), p.equity - p.initial, `${rubSigned(p.equity - p.initial)} · ${pct(p.total_return_pct)}`);
   if (p.today_pnl == null) setDelta($('#today-delta'), 0, '—');
   else setDelta($('#today-delta'), p.today_pnl, rubSigned(p.today_pnl));
+  setDelta($('#cash-yield'), p.cash_yield || 0, rubSigned(p.cash_yield || 0));
   setDelta($('#realized'), p.realized, rubSigned(p.realized), 'tile-value');
   setDelta($('#unrealized'), p.unrealized, rubSigned(p.unrealized), 'tile-value');
   $('#invested').textContent = `в бумагах ${rub(p.invested)} · свободно ${rub(p.cash)}`;
@@ -887,6 +890,13 @@ async function refreshState() {
   if (!a.last_tick_ms) renderPill($('#pill-agent'), 'warn', 'Агент ещё не делал тиков');
   else if (a.stale) renderPill($('#pill-agent'), 'warn', `Агент молчит · последний тик ${ago(a.last_tick_ms)}`);
   else renderPill($('#pill-agent'), 'up', `Агент работает · тик ${ago(a.last_tick_ms)}`);
+  const model = s.model;
+  $('#pill-model').hidden = !model;
+  if (model) {
+    renderPill($('#pill-model'), 'accent',
+      `Стратегия ML · модель на данных до ${T_DM.format(new Date(model.trained_until_ms))}`
+      + (model.auc ? ` · AUC ${num(model.auc, 3)}` : ''));
+  }
   renderPill($('#pill-session'), s.session_open ? 'accent' : '',
     s.session_open ? 'Основная сессия · агент открывает сделки' : 'Вне основной сессии · только сопровождение');
 
@@ -938,20 +948,15 @@ async function refreshJournal() {
   }) : [h('div', { class: 'empty', text: 'Журнал пуст' })]));
 }
 
-function sentimentChip(item) {
-  if (item.sentiment >= 0.2) return chip('позитив', 'up');
-  if (item.sentiment <= -0.2) return chip('негатив', 'down');
-  return null;
-}
-
 async function refreshNews() {
   const list = await api('/api/news?limit=40');
   $('#news').replaceChildren(...(list.length ? list.map(n => h('article', { class: 'news-item' },
     h('div', { class: 'news-meta' },
       h('span', { class: 'num', text: when(n.ms) }),
-      sentimentChip(n),
+      n.market && chip('рынок', 'accent'),
       n.political && chip('политика', 'warn'),
-      ...n.tickers.map(t => h('span', { class: 'chip', text: t }))),
+      ...n.tickers.map(t => h('span', { class: 'chip', text: t })),
+      n.sector.length > 0 && h('span', { class: 'chip', title: 'Отраслевая новость', text: 'отрасль: ' + n.sector.join(', ') })),
     h('div', { class: 'news-text', text: n.text }),
     h('div', { class: 'news-actions' },
       h('button', {

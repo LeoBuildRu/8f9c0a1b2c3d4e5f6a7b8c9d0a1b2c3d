@@ -1,0 +1,13 @@
+[Unit]
+Description=LeoAgent — monthly ML model retraining
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/leoagent/server/deploy/retrain_ml.sh
+StandardOutput=journal
+StandardError=journal
+# Пересчёт сигналов идёт около часа: не мешаем агенту и VPN
+Nice=15
+CPUQuota=300%

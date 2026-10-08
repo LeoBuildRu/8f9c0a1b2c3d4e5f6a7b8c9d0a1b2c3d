@@ -24,6 +24,7 @@ TraderAgent (выбор стороны, приоритет, горизонт с�
     python backtest.py                         # дневной агент + случайный вход для сравнения
     python backtest.py --strategy agent_h1     # текущий агент на часовых свечах
     python backtest.py --strategy agent_h1 --tickers SBER,NLMK,MAGN   # свой список бумаг
+    python backtest.py --strategy agent_h1 --experiments   # гипотезы по часовой стратегии
     python backtest.py --sweep                 # сетка множителей SL/TP: winrate против доходности
     python backtest.py --strategy momentum     # альтернатива: ротация по моментуму
     python backtest.py --research --period is  # все дневные эксперименты на периоде подбора 2023–2024
@@ -33,6 +34,7 @@ TraderAgent (выбор стороны, приоритет, горизонт с�
 from __future__ import annotations
 
 import argparse
+import bisect
 import math
 import random
 import statistics
@@ -105,10 +107,28 @@ def load_history(ticker: str, end: datetime, refresh: bool = False,
     return df
 
 
+def load_lqdt(end: datetime, refresh: bool = False) -> pd.Series:
+    """Цены фонда LQDT. В 2026 году фонд переехал с режима TQTF на TQBR,
+    поэтому история склеивается из обоих; без свежих данных — из кэша."""
+    path = HISTORY_DIR / "LQDT.csv"
+    if refresh or not path.exists():
+        parts = [fetch_moex_data("LQDT", DATA_START, end, interval=DAILY, timeout=30, board=b, http_get=_polite_get)
+                 for b in ("TQTF", "TQBR")]
+        parts = [p for p in parts if not p.empty]
+        if parts:
+            HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+            pd.concat(parts).drop_duplicates("DATE", keep="last").sort_values("DATE").to_csv(path, index=False)
+    if not path.exists():
+        return pd.Series(dtype=float)
+    return pd.read_csv(path, parse_dates=["DATE"]).set_index("DATE")["CLOSE"]
+
+
 # ── Сигналы ─────────────────────────────────────────────────────────────────
-# Колонки сигнала: priority — порядок отбора кандидатов, buy/sell — вход в лонг
-# или шорт, exit_long/exit_short — выход по смене сигнала.
-SIG_COLS = ["priority", "buy", "sell", "exit_long", "exit_short", "atr_pct", "conf", "horizon_h"]
+# Колонки сигнала: priority — порядок отбора кандидатов, score — сила сигнала
+# со знаком, buy/sell — вход в лонг или шорт, exit_long/exit_short — выход по
+# смене сигнала. Остальные колонки (признаки для ML) симуляция не читает.
+SIG_COLS = ["priority", "score", "buy", "sell", "exit_long", "exit_short", "atr_pct", "conf", "horizon_h"]
+SIGNALS_DIR = BASE_DIR / "data" / "signals"
 
 
 def legacy_daily_horizon(sig, confidence: float) -> float:
@@ -146,6 +166,7 @@ def agent_signals(ticker: str, df: pd.DataFrame, start: datetime, use_ml: bool =
         rows.append({
             "DATE": d,
             "priority": sig.score,
+            "score": sig.score,
             # min_signal_score=1.5, но direction=BUY требует score>=2; порог
             # уверенности 0.22 и risk_score<=0.85 без новостей проходят всегда.
             "buy": sig.direction == "BUY" and sig.score >= 1.5,
@@ -175,7 +196,7 @@ def agent_h1_signals(ticker: str, df: pd.DataFrame, start: datetime, use_ml: boo
     rows = []
     for i in range(dates.searchsorted(start - timedelta(days=2)), len(df)):
         d = dates.iloc[i]
-        if d.weekday() >= 5 or not (SESSION_OPEN.hour - 1 <= d.hour < SESSION_CLOSE.hour):
+        if not TraderAgent.signal_bar_ok(d):
             continue
         lo = dates.searchsorted(d - timedelta(days=H1_LOOKBACK_DAYS), side="right")
         sig = analyzer.analyze_ticker(ticker, df=df.iloc[lo:i + 1].reset_index(drop=True))
@@ -186,6 +207,7 @@ def agent_h1_signals(ticker: str, df: pd.DataFrame, start: datetime, use_ml: boo
         rows.append({
             "DATE": d,
             "priority": TraderAgent._speed_priority(sig),
+            "score": sig.score,
             "buy": side == "LONG",
             "sell": side == "SHORT",
             "exit_long": sig.direction == "SELL" and sig.score <= -2.5,
@@ -193,6 +215,15 @@ def agent_h1_signals(ticker: str, df: pd.DataFrame, start: datetime, use_ml: boo
             "atr_pct": sig.atr_pct,
             "conf": conf,
             "horizon_h": TraderAgent._choose_horizon(None, sig, conf),
+            # Признаки для ML-экспериментов — симуляция их не использует
+            "price": sig.price,
+            "rsi": sig.rsi,
+            "macd_hist": None if sig.macd is None or sig.macd_signal is None else sig.macd - sig.macd_signal,
+            "vol_annual": sig.volatility_annual,
+            "trend_5": sig.trend_5d,
+            "trend_20": sig.trend_20d,
+            "dist_sma20": sig.price / sig.sma20 - 1 if sig.sma20 else None,
+            "dist_sma50": sig.price / sig.sma50 - 1 if sig.sma50 else None,
         })
     return pd.DataFrame(rows)
 
@@ -209,6 +240,7 @@ def rsi2_signals(ticker: str, df: pd.DataFrame, start: datetime, use_ml: bool = 
     out = pd.DataFrame({
         "DATE": df["DATE"],
         "priority": 100.0 - rsi2,
+        "score": 100.0 - rsi2,
         "buy": (rsi2 < 10) & (close > close.rolling(200).mean()),
         "sell": False,
         "exit_long": close > close.rolling(5).mean(),
@@ -238,6 +270,7 @@ def momentum_signals(history: Dict[str, pd.DataFrame], start: datetime,
         atr_pct = pd.Series((atr / df["CLOSE"] * 100.0).values, index=df["DATE"])
         sig = pd.DataFrame({
             "priority": mom[t],
+            "score": mom[t],
             "buy": (rank[t] <= top) & above_sma[t],
             "sell": False,
             "exit_long": rank[t] > keep,
@@ -282,12 +315,18 @@ class SimConfig:
     capital: float = 1_000_000.0
     risk: RiskParams = field(default_factory=RiskParams)
     use_take: bool = True
+    allow_long: bool = True
     allow_short: bool = False
+    min_score: float = 0.0                  # входить, только если |score| не меньше
+    skip_entry_hours: Tuple[int, ...] = ()  # (часовые) не входить в эти часы по Москве
     max_new_per_day: int = 3                # как candidates[:3] в tick()
-    regime_sma: Optional[int] = None        # (дневные) входить, только если IMOEX выше SMA(N)
+    # Фильтр рынка по IMOEX > SMA(N): дневные — входы только при росте рынка;
+    # часовые — лонги при росте, шорты при падении (по закрытию прошлого дня)
+    regime_sma: Optional[int] = None
     cooldown_days: int = 0                  # пауза по бумаге после стоп-лосса
     horizon_mult: float = 1.0               # множитель горизонта сделки
     cash_yield: bool = False                # свободные деньги лежат в LQDT
+    entry_on_close: bool = False            # стресс-тест: вход на час позже — по закрытию следующей свечи
     random_entry_p: Optional[float] = None  # контрольная группа: вход наугад
     seed: int = 0
 
@@ -332,10 +371,18 @@ def simulate(mkt: Market, start: datetime, end: Optional[datetime], cfg: SimConf
     # Дневная свеча: вход ~10:00, закрытие ~19:00. Часовая: от начала до +1 ч.
     entry_offset = timedelta(0) if mkt.intraday else timedelta(hours=10)
     bar_end = timedelta(hours=1) if mkt.intraday else timedelta(hours=19)
-    regime = None
+    regime = regime_days = regime_up = None
     if cfg.regime_sma:
-        regime = (mkt.imoex > mkt.imoex.rolling(cfg.regime_sma).mean()).to_dict()
+        up = mkt.imoex > mkt.imoex.rolling(cfg.regime_sma).mean()
+        regime = up.to_dict()
+        regime_days, regime_up = list(up.index), list(up.values)
+
+    def market_up(d: datetime) -> Optional[bool]:
+        """Часовые: режим по закрытию предыдущего торгового дня — без заглядывания вперёд."""
+        i = bisect.bisect_left(regime_days, d.replace(hour=0, minute=0, second=0)) - 1
+        return bool(regime_up[i]) if i >= 0 else None
     lqdt_ret = mkt.lqdt.pct_change().fillna(0.0).to_dict() if cfg.cash_yield else {}
+    cash_yield_day = None  # часовые свечи: начисляем раз в день, на первой свече дня
     blocked_until: Dict[str, datetime] = {}
     last_close: Dict[str, float] = {}
     pending: List[Tuple[str, dict, str]] = []
@@ -344,7 +391,10 @@ def simulate(mkt: Market, start: datetime, end: Optional[datetime], cfg: SimConf
     for d in sorted(x for x in mkt.day_bars if x >= start and (end is None or x <= end)):
         bars = mkt.day_bars[d]
         sigs = {t: dict(zip(SIG_COLS, v)) for t, v in mkt.day_sigs.get(d, {}).items()}
-        pf._cash *= 1 + lqdt_ret.get(d, 0.0)
+        day = d.replace(hour=0, minute=0, second=0)
+        if day != cash_yield_day:
+            pf._cash *= 1 + lqdt_ret.get(day, 0.0)
+            cash_yield_day = day
 
         # 1. Входы по сигналам прошлой свечи — по цене открытия этой
         if mkt.intraday and not _in_session(d):
@@ -354,7 +404,7 @@ def simulate(mkt: Market, start: datetime, end: Optional[datetime], cfg: SimConf
                 continue
             if not risk.can_open_new()[0]:
                 break
-            price = bars[t][0]
+            price = bars[t][3] if cfg.entry_on_close else bars[t][0]
             plan = risk.plan_trade(t, price, s["atr_pct"], political_risk=0.0, confidence=s["conf"], side=side)
             if plan is None or plan.qty <= 0:
                 continue
@@ -368,6 +418,8 @@ def simulate(mkt: Market, start: datetime, end: Optional[datetime], cfg: SimConf
                 "tp": plan.take_profit if cfg.use_take else no_take,
                 "entry_date": d,
                 "deadline": d + entry_offset + timedelta(hours=s["horizon_h"] * cfg.horizon_mult),
+                # вход по закрытию: максимум и минимум этой свечи были до входа
+                "skip_bar": d if cfg.entry_on_close else None,
             }
         pending = []
 
@@ -377,6 +429,8 @@ def simulate(mkt: Market, start: datetime, end: Optional[datetime], cfg: SimConf
                 continue
             o, h, l, c = bars[t]
             p = pf.positions[t]
+            if p.get("skip_bar") == d:
+                continue
             is_long = p["side"] == "LONG"
             # «хуже» и «лучше» для позиции: для шорта рост цены — это убыток
             worst, best = (l, h) if is_long else (h, l)
@@ -424,7 +478,16 @@ def simulate(mkt: Market, start: datetime, end: Optional[datetime], cfg: SimConf
         equity.append((d, pf._cash + pf.positions_value(last_close)))
 
         # 4. Кандидаты на следующую свечу
-        if regime is not None and not regime.get(d, False):
+        allow_long, allow_short = cfg.allow_long, cfg.allow_short
+        if regime is not None:
+            if not mkt.intraday:
+                if not regime.get(d, False):
+                    continue
+            else:
+                up = market_up(d)
+                allow_long = allow_long and up is True
+                allow_short = allow_short and up is False
+        if mkt.intraday and cfg.skip_entry_hours and (d + timedelta(hours=1)).hour in cfg.skip_entry_hours:
             continue
         cands = []
         for t, s in sigs.items():
@@ -435,9 +498,12 @@ def simulate(mkt: Market, start: datetime, end: Optional[datetime], cfg: SimConf
                     side = rng.choice(["LONG", "SHORT"]) if cfg.allow_short else "LONG"
                     horizon = 12.0 if mkt.intraday else 72.0
                     cands.append((rng.random(), t, {**s, "conf": 0.4, "horizon_h": horizon}, side))
-            elif s["buy"]:
+                continue
+            if abs(s["score"]) < cfg.min_score:
+                continue
+            if allow_long and s["buy"]:
                 cands.append((s["priority"], t, s, "LONG"))
-            elif cfg.allow_short and s["sell"]:
+            elif allow_short and s["sell"]:
                 cands.append((s["priority"], t, s, "SHORT"))
         cands.sort(key=lambda x: x[0], reverse=True)
         pending = [(t, s, side) for _, t, s, side in cands[:cfg.max_new_per_day]]
@@ -505,7 +571,8 @@ def random_baseline(mkt: Market, start: datetime, end: Optional[datetime], base:
     """Те же выходы и размер позиций, но вход наугад с той же частотой,
     с какой стратегия даёт сигналы на вход. Медиана по `seeds` прогонам."""
     rows = [v for d, day in mkt.day_sigs.items() if d >= start and (end is None or d <= end) for v in day.values()]
-    entry_share = sum(1 for v in rows if v[1] or (base.allow_short and v[2])) / max(len(rows), 1)
+    buy, sell = SIG_COLS.index("buy"), SIG_COLS.index("sell")
+    entry_share = sum(1 for v in rows if v[buy] or (base.allow_short and v[sell])) / max(len(rows), 1)
     runs = []
     for seed in range(seeds):
         cfg = replace(base, random_entry_p=entry_share, seed=seed)
@@ -517,23 +584,95 @@ def random_baseline(mkt: Market, start: datetime, end: Optional[datetime], base:
 
 
 # ── Сценарии ────────────────────────────────────────────────────────────────
+def _signals_cache(strategy: str, ticker: str, use_ml: bool, interval: int) -> Tuple[Path, Path]:
+    """Файл кэша сигналов и файл истории, из которой он посчитан."""
+    suffix = "" if interval == DAILY else f"_m{interval}"
+    name = f"{strategy}{'_ml' if use_ml else ''}_{ticker}.csv"
+    return SIGNALS_DIR / name, HISTORY_DIR / f"{ticker}{suffix}.csv"
+
+
 def build_markets(strategies: List[str], history: Dict[str, pd.DataFrame], imoex: pd.Series,
                   lqdt: pd.Series, start: datetime, workers: int, use_ml: bool,
-                  intraday: bool = False) -> Dict[str, Market]:
+                  intraday: bool = False, use_cache: bool = True) -> Dict[str, Market]:
     day_bars = by_date(history, ["OPEN", "HIGH", "LOW", "CLOSE"])
+    interval = HOURLY if intraday else DAILY
     markets = {}
     for strategy in strategies:
-        print(f"Считаю сигналы «{strategy}» по {len(history)} бумагам…", flush=True)
         if strategy in TICKER_STRATEGIES:
-            jobs = [(strategy, t, df, start, use_ml) for t, df in history.items()]
-            with ProcessPoolExecutor(max_workers=workers) as pool:
-                signals = dict(pool.map(_signals_job, jobs))
+            # Сигналы считаются долго (часовые — десятки минут), поэтому кэшируются
+            # на диск и пересчитываются, только если история свежее кэша.
+            signals, todo = {}, []
+            for t, df in history.items():
+                cache, source = _signals_cache(strategy, t, use_ml, interval)
+                if use_cache and cache.exists() and cache.stat().st_mtime >= source.stat().st_mtime:
+                    signals[t] = pd.read_csv(cache, parse_dates=["DATE"])
+                else:
+                    todo.append((strategy, t, df, start, use_ml))
+            print(f"Сигналы «{strategy}»: из кэша {len(signals)}, считаю {len(todo)} бумаг…", flush=True)
+            if todo:
+                SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
+                with ProcessPoolExecutor(max_workers=workers) as pool:
+                    for t, sig in pool.map(_signals_job, todo):
+                        sig.to_csv(_signals_cache(strategy, t, use_ml, interval)[0], index=False)
+                        signals[t] = sig
         else:
             name, lookback = strategy.split(":") if ":" in strategy else (strategy, "126")
             signals = momentum_signals(history, start, lookback=int(lookback))
         day_sigs = by_date({t: s for t, s in signals.items() if not s.empty}, SIG_COLS)
         markets[strategy] = Market(day_bars, day_sigs, imoex, lqdt, intraday=intraday)
     return markets
+
+
+def h1(**overrides) -> SimConfig:
+    """Настройки часовой стратегии как в проде, с заменой отдельных параметров."""
+    return SimConfig(**{"risk": INTRADAY_RISK, "allow_short": True, **overrides})
+
+
+# Гипотезы для часовой стратегии — заданы заранее, а не подобраны по результату.
+# Изменение принимаем, только если оно лучше и на 2023–2024, и на 2025–2026.
+H1_EXPERIMENTS = [
+    ("текущая стратегия", h1()),
+    # Стоп срабатывает вдвое чаще тейка — возможно, он стоит в рыночном шуме
+    ("стоп ATR×3, тейк ATR×4,5", h1(risk=replace(INTRADAY_RISK, atr_stop_mult=3, atr_take_mult=4.5))),
+    ("стоп ATR×4, тейк ATR×6", h1(risk=replace(INTRADAY_RISK, atr_stop_mult=4, atr_take_mult=6))),
+    ("стоп ATR×2, тейк ATR×2", h1(risk=replace(INTRADAY_RISK, atr_stop_mult=2, atr_take_mult=2))),
+    ("стоп ATR×3, без тейка", h1(risk=replace(INTRADAY_RISK, atr_stop_mult=3), use_take=False)),
+    ("стоп 4%, без тейка", h1(risk=replace(INTRADAY_RISK, atr_stop_mult=50), use_take=False)),
+    # Меньше сделок — меньше комиссий
+    ("порог |скор| ≥ 2,5", h1(min_score=2.5)),
+    ("порог |скор| ≥ 3", h1(min_score=3.0)),
+    ("порог |скор| ≥ 3,5", h1(min_score=3.5)),
+    # Время входа и стороны
+    ("без входов в 13 и 15 ч", h1(skip_entry_hours=(13, 15))),
+    ("только шорты", h1(allow_long=False)),
+    ("только лонги", h1(allow_short=False)),
+    ("лонг при IMOEX>SMA100, шорт ниже", h1(regime_sma=100)),
+    ("лонг при IMOEX>SMA50, шорт ниже", h1(regime_sma=50)),
+    # Длительность сделки
+    ("горизонт ×0,5", h1(horizon_mult=0.5)),
+    ("горизонт ×2", h1(horizon_mult=2.0)),
+]
+
+H1_HEADER = (f"{'':<34}{'2023–2024: сделок':>18}{'win':>7}{'PF':>6}{'итого':>9}"
+             f"{'2025–2026: сделок':>20}{'win':>7}{'PF':>6}{'итого':>9}")
+
+
+def fmt_pair(label: str, a: dict, b: dict) -> str:
+    cell = lambda r: f"{r['trades']:>18}{r['winrate']:>6.1f}%{r['pf']:>6.2f}{r['total']:>+8.1f}%"
+    return f"{label:<34}{cell(a)}  {cell(b)}"
+
+
+def run_h1_experiments(mkt: Market, seeds: int) -> None:
+    (is_start, is_end), (oos_start, oos_end) = PERIODS["is"], PERIODS["oos"]
+    print(H1_HEADER)
+    for label, cfg in H1_EXPERIMENTS:
+        a = summarize("", *simulate(mkt, is_start, is_end, cfg), cfg.capital)
+        b = summarize("", *simulate(mkt, oos_start, oos_end, cfg), cfg.capital)
+        print(fmt_pair(label, a, b), flush=True)
+    base = h1()
+    print(fmt_pair(f"случайный вход (медиана {seeds})",
+                   random_baseline(mkt, is_start, is_end, base, seeds),
+                   random_baseline(mkt, oos_start, oos_end, base, seeds)))
 
 
 # Эксперименты дневной версии: (стратегия, подпись, настройки). Решения
@@ -594,6 +733,10 @@ def main() -> None:
     ap.add_argument("--period", choices=sorted(PERIODS), default="all",
                     help="is — подбор 2023–2024, oos — проверка с 2025, all — всё")
     ap.add_argument("--research", action="store_true", help="прогнать все дневные эксперименты из EXPERIMENTS")
+    ap.add_argument("--experiments", action="store_true", help="(agent_h1) прогнать гипотезы из H1_EXPERIMENTS")
+    ap.add_argument("--no-cache", action="store_true", help="пересчитать сигналы, не читая кэш data/signals/")
+    ap.add_argument("--prepare-only", action="store_true",
+                    help="только обновить историю и кэш сигналов (для переобучения ML), без прогонов")
     ap.add_argument("--sweep", action="store_true", help="сетка множителей SL/TP")
     ap.add_argument("--cash-yield", action="store_true", help="свободные деньги лежат в LQDT")
     ap.add_argument("--ml", action="store_true", help="включить ML-прогноз в скоринг агента (долго)")
@@ -616,13 +759,22 @@ def main() -> None:
         else:
             history[t] = df
     imoex = load_history("IMOEX", now, refresh=args.refresh).set_index("DATE")["CLOSE"]
-    lqdt = load_history("LQDT", now, refresh=args.refresh, board="TQTF").set_index("DATE")["CLOSE"]
+    if intraday and args.refresh:
+        load_history("IMOEX", now, refresh=True, interval=HOURLY)  # для ML-признаков (research/price_ml.py)
+    lqdt = load_lqdt(now, refresh=args.refresh)
 
     strategies = sorted({s for s, _, _ in EXPERIMENTS}) if args.research else [args.strategy]
-    markets = build_markets(strategies, history, imoex, lqdt, PERIODS["all"][0], args.workers, args.ml, intraday)
+    markets = build_markets(strategies, history, imoex, lqdt, PERIODS["all"][0], args.workers, args.ml,
+                            intraday, use_cache=not args.no_cache)
+    if args.prepare_only:
+        print("История и сигналы обновлены.")
+        return
 
     if intraday:
-        base = SimConfig(risk=INTRADAY_RISK, allow_short=True, cash_yield=args.cash_yield)
+        if args.experiments:
+            run_h1_experiments(markets[args.strategy], args.random_seeds)
+            return
+        base = h1(cash_yield=args.cash_yield)
         trades = run_intraday(markets[args.strategy], base, args.random_seeds)
     else:
         period_end = end or max(next(iter(markets.values())).day_bars)

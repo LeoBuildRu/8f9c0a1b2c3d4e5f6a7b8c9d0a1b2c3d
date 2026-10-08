@@ -1,0 +1,10 @@
+[Unit]
+Description=LeoAgent — retrain ML model on the first Sunday of every month
+
+[Timer]
+# Первое воскресенье месяца, 01:00 UTC (04:00 МСК) — биржа закрыта
+OnCalendar=Sun *-*-01..07 01:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

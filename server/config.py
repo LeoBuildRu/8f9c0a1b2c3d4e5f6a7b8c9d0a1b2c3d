@@ -52,8 +52,13 @@ for raw in _env_list("LEOAGENT_TG_ADMINS"):
     except ValueError:
         pass
 
-# ── Капитал ──────────────────────────────────────────────────────────────────
+# ── Капитал и стратегия ─────────────────────────────────────────────────────
 CAPITAL_LIMIT: float = _env_float("LEOAGENT_CAPITAL", 1_000_000.0)
+# "ml" — входы по прогнозу LightGBM (модель в data/models/, см. research/train_ml.py);
+# "indicators" — прежний скоринг RSI/MACD/средних. Без модели агент сам вернётся к индикаторам.
+STRATEGY: str = (_env("LEOAGENT_STRATEGY", "ml") or "ml").lower()
+# Свободные деньги считаются лежащими в фонде денежного рынка LQDT
+CASH_YIELD: bool = (_env("LEOAGENT_CASH_YIELD", "true") or "true").lower() in ("1", "true", "yes")
 
 # ── Пути ─────────────────────────────────────────────────────────────────────
 DATA_DIR = Path(_env("LEOAGENT_DATA_DIR", str(BASE_DIR / "data")))

@@ -71,6 +71,28 @@ class Portfolio:
         self.db.update_cash(self.cash() + proceeds)
         return proceeds
 
+    # ── Доход на свободных деньгах ───────────────────────────────────────────
+    def accrue_cash_yield(self, fund_price: float, trade_date: str) -> float:
+        """Свободный кэш «лежит» в фонде денежного рынка (LQDT): раз в торговый
+        день он растёт так же, как цена фонда. Возвращает начисление в рублях."""
+        last_date = self.db.get_kv("cash_fund_date")
+        last_price = float(self.db.get_kv("cash_fund_price", "0") or 0)
+        if last_date == trade_date:
+            return 0.0
+        accrued = 0.0
+        cash = self.cash()
+        if last_price > 0 and cash > 0:
+            accrued = cash * (fund_price / last_price - 1)
+            self.db.update_cash(cash + accrued)
+            total = float(self.db.get_kv("cash_yield_total", "0") or 0)
+            self.db.set_kv("cash_yield_total", round(total + accrued, 2))
+        self.db.set_kv("cash_fund_price", fund_price)
+        self.db.set_kv("cash_fund_date", trade_date)
+        return accrued
+
+    def cash_yield_total(self) -> float:
+        return float(self.db.get_kv("cash_yield_total", "0") or 0)
+
     # ── Сводка ───────────────────────────────────────────────────────────────
     def summary(self, prices: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
         prices = prices or {}

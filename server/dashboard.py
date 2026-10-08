@@ -255,6 +255,11 @@ def build_state() -> Dict[str, Any]:
         open_rows = [dict(r) for r in c.execute("SELECT * FROM trades WHERE status = 'OPEN' ORDER BY opened_at")]
         closed = [r["pnl_abs"] or 0.0 for r in c.execute("SELECT pnl_abs FROM trades WHERE status = 'CLOSED'")]
         last_decision = c.execute("SELECT MAX(created_at) FROM decisions").fetchone()[0]
+        try:  # таблица kv появляется после обновления агента
+            row = c.execute("SELECT value FROM kv WHERE key = 'cash_yield_total'").fetchone()
+            cash_yield = float(row[0]) if row else 0.0
+        except sqlite3.OperationalError:
+            cash_yield = 0.0
 
     positions = [_position_view(t, prices.get(t["ticker"], t["entry_price"]), now) for t in open_rows]
     initial, cash = pf["initial_capital"], pf["cash"]
@@ -271,8 +276,18 @@ def build_state() -> Dict[str, Any]:
     )
 
     tick_at = _parse_utc(last_decision)
+    model_meta = None
+    meta_path = config.DATA_DIR / "models" / "ml_h6.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            model_meta = {"trained_until_ms": _ms(_parse_utc(meta.get("trained_until"))),
+                          "auc": meta.get("auc_oof_last_year")}
+        except (ValueError, OSError):
+            pass
     return {
         "now_ms": _ms(now),
+        "model": model_meta,
         "session_open": TraderAgent._session_open(now),
         "agent": {
             "last_tick_ms": _ms(tick_at),
@@ -285,6 +300,7 @@ def build_state() -> Dict[str, Any]:
             "invested": sum(p["value"] for p in positions),
             "unrealized": sum(p["pnl_abs"] for p in positions),
             "realized": sum(closed),
+            "cash_yield": cash_yield,
             "total_return_pct": (equity / initial - 1) * 100 if initial else 0.0,
             "today_pnl": equity - day_start if day_start is not None else None,
             "open_count": len(positions),
@@ -346,14 +362,17 @@ def news(limit: int) -> List[Dict[str, Any]]:
     out = []
     for item in items[:limit]:
         text = (item.get("text") or "").strip()
-        sentiment, political = NewsAnalyzer._score_text(text)
+        targets = NewsAnalyzer.targets(text)
+        # Тональность словаря не показываем: на истории она ошибалась чаще,
+        # чем угадывала (research/news_eval.py). Показываем, к чему относится пост.
         out.append({
             "ms": _ms(_parse_utc(item.get("date"))),
             "text": text[:600],
             "link": item.get("link"),
-            "sentiment": sentiment,
-            "political": political,
-            "tickers": NewsAnalyzer._mentions(text),
+            "political": NewsAnalyzer._score_text(text)[1],
+            "market": any(scope == "market" for _, scope in targets),
+            "tickers": [t for t, scope in targets if scope == "company"],
+            "sector": [t for t, scope in targets if scope == "sector"][:4],
         })
     return out
 

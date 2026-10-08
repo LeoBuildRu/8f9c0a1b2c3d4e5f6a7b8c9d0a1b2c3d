@@ -15,7 +15,9 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from app.config import STOCKS
 
 NEWS_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "cbr_news.json")
 
@@ -122,6 +124,39 @@ TICKER_ALIASES: Dict[str, List[str]] = {
 }
 
 
+# Канал сам размечает посты хэштегами: #SBER — компания, #Нефтянка — отрасль,
+# #Макро/#Политика — весь рынок. Хэштег надёжнее поиска названий в тексте.
+SECTOR_TAGS: Dict[str, List[str]] = {
+    "нефтянка": ["LKOH", "ROSN", "TATN", "TATNP", "SNGS", "SNGSP", "BANE", "BANEP"],
+    "нефть": ["LKOH", "ROSN", "TATN", "TATNP", "SNGS", "SNGSP", "BANE", "BANEP"],
+    "газ": ["GAZP", "NVTK"],
+    "банки": ["SBER", "SBERP", "VTBR", "T", "BSPB", "CBOM", "SVCB"],
+    "металлурги": ["CHMF", "NLMK", "MAGN", "GMKN", "RUAL"],
+    "металлы": ["CHMF", "NLMK", "MAGN", "GMKN", "RUAL"],
+    "золото": ["PLZL", "UGLD", "SELG"],
+    "уголь": ["MTLR", "RASP"],
+    "алмазы": ["ALRS"],
+    "удобрения": ["PHOR", "AKRN"],
+    "ритейл": ["MGNT", "X5", "FIXR"],
+    "маркетплейсы": ["OZON"],
+    "телеком": ["MTSS", "RTKM"],
+    "энергетика": ["IRAO", "HYDR", "FEES", "UPRO"],
+    "электроэнергетика": ["IRAO", "HYDR", "FEES", "UPRO"],
+    "авиа": ["AFLT"],
+    "авиация": ["AFLT"],
+    "недвижимость": ["SMLT", "PIKK", "ETLN", "LSRG"],
+    "девелоперы": ["SMLT", "PIKK", "ETLN", "LSRG"],
+}
+MARKET_TAGS = {"макро", "цбрф", "политика", "санкции", "геополитика", "imoex", "прогноз", "бонды", "статистика"}
+POLITICAL_TAGS = {"политика", "санкции", "геополитика"}
+_HASHTAG_RX = re.compile(r"#([A-Za-zА-Яа-яЁё0-9_]+)")
+_TICKER_WORD_RX = re.compile(r"(?<![\w#$])([A-Z]{3,5})(?!\w)")  # «Данные CBOM за сегодня»
+
+
+def hashtags(text: str) -> set:
+    return {t.lower() for t in _HASHTAG_RX.findall(text)}
+
+
 def _term_regex(term: str) -> "re.Pattern[str]":
     """Термин ищется с начала слова: «газпром» находит «Газпрома», но «рост»
     больше не находит «простой», а «moex» — «IMOEX». Пробел в конце термина
@@ -205,19 +240,46 @@ class NewsAnalyzer:
         text_low = text.lower()
         pos = sum(1 for rx in _POSITIVE_RX if rx.search(text_low))
         neg = sum(1 for rx in _NEGATIVE_RX if rx.search(text_low))
-        political = any(rx.search(text_low) for rx in _POLITICAL_RX)
+        political = bool(hashtags(text) & POLITICAL_TAGS) or any(rx.search(text_low) for rx in _POLITICAL_RX)
         if pos == 0 and neg == 0:
             return 0.0, political
         score = (pos - neg) / (pos + neg)
         return float(score), political
 
     @staticmethod
-    def _mentions(text: str) -> List[str]:
+    def _alias_mentions(text: str) -> List[str]:
+        """Компании, найденные по названиям в тексте (запасной способ без хэштегов)."""
         low = text.lower()
         return [
             ticker for ticker, patterns in _ALIAS_RX.items()
             if any(rx.search(low) for rx in patterns)
         ]
+
+    @staticmethod
+    def targets(text: str) -> List[Tuple[str, str]]:
+        """К чему относится пост: [(тикер, "company" | "sector")] или [("IMOEX", "market")].
+
+        Сначала хэштеги тикеров, если их нет — названия компаний в тексте; затем
+        отраслевые хэштеги; новость без компаний и отраслей с макро- или
+        политическим хэштегом относится ко всему рынку."""
+        tags = hashtags(text)
+        found = [(t.upper(), "company") for t in sorted(tags) if t.upper() in STOCKS and t.upper() != "IMOEX"]
+        if not found:
+            words = dict.fromkeys(w for w in _TICKER_WORD_RX.findall(text) if w in STOCKS and w != "IMOEX")
+            found = [(t, "company") for t in words]
+        if not found:
+            found = [(t, "company") for t in NewsAnalyzer._alias_mentions(text)]
+        companies = {t for t, _ in found}
+        for tag in sorted(tags):
+            found += [(t, "sector") for t in SECTOR_TAGS.get(tag, []) if t not in companies]
+        if not found and tags & MARKET_TAGS:
+            found = [("IMOEX", "market")]
+        return list(dict.fromkeys(found))
+
+    @staticmethod
+    def _mentions(text: str) -> List[str]:
+        """Бумаги, к которым относится пост: компании и их отрасли."""
+        return [t for t, scope in NewsAnalyzer.targets(text) if scope != "market"]
 
     # ── Главный вход ──────────────────────────────────────────────────────────
     def assess(self, tickers: Optional[Iterable[str]] = None) -> NewsAssessment:

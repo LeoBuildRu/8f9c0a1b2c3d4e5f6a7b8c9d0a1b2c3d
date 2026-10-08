@@ -50,9 +50,11 @@ class RiskManager:
         political_risk: float = 0.0,
         confidence: float = 0.5,
         side: str = "LONG",
+        lot: int = 1,
     ) -> Optional[TradePlan]:
         """Размер и уровни сделки. Для SHORT стоп выше цены входа, тейк — ниже;
-        под шорт резервируется обеспечение на ту же сумму, что и под лонг."""
+        под шорт резервируется обеспечение на ту же сумму, что и под лонг.
+        lot — размер лота на MOEX: количество округляется вниз до целых лотов."""
         if price <= 0:
             return None
 
@@ -120,6 +122,12 @@ class RiskManager:
             qty = max(0, int(allowed_value // price))
             if qty <= 0:
                 return None
+
+        # На бирже торгуют целыми лотами
+        lot = max(1, int(lot or 1))
+        qty = qty // lot * lot
+        if qty <= 0:
+            return None
 
         # 6. Позиция, урезанная под остаток кэша или лимита, — «пылинка» вроде
         #    5 акций на 2 ₽: заработать не может, а слот из 8 занимает.

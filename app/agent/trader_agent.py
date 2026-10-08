@@ -18,8 +18,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from app.data_services import fetch_stock_data_with_fallback
+import pandas as pd
+import requests
+
+from app.data_services import fetch_moex_data, fetch_stock_data_with_fallback
 from app.agent.database import AgentDB
+from app.agent.ml_model import MLModel, feature_row
 from app.agent.market_analyzer import MarketAnalyzer, TickerSignal
 from app.agent.news_analyzer import NewsAnalyzer, NewsAssessment
 from app.agent.portfolio import Portfolio
@@ -94,12 +98,25 @@ class TraderAgent:
         regime_sma: Optional[int] = None,
         interval: int = CANDLE_INTERVAL,
         lookback_days: int = LOOKBACK_DAYS,
+        cash_yield: bool = True,
+        strategy: str = "indicators",
+        ml_model: Optional[MLModel] = None,
     ):
         self.stocks_map = stocks_map
         self.db = AgentDB(db_path, initial_capital=capital_limit) if db_path else AgentDB(initial_capital=capital_limit)
         self.portfolio = Portfolio(self.db)
         self.risk = RiskManager(self.portfolio, risk_params or INTRADAY_RISK)
-        self.market = MarketAnalyzer(stocks_map, predictor=predictor, lookback_days=lookback_days, interval=interval)
+        # Стратегия входа: "ml" — прогноз LightGBM (research/price_ml.py, проверен на
+        # 2025–2026), "indicators" — скоринг RSI/MACD/средних. Без модели — индикаторы.
+        self.ml: Optional[MLModel] = None
+        if strategy == "ml":
+            self.ml = ml_model or MLModel.load()
+            if self.ml is None:
+                print("[TraderAgent] ML-модель не найдена в data/models — работаю по индикаторам")
+        self.strategy = "ml" if self.ml is not None else "indicators"
+        self._ml_used_bar: Dict[str, Any] = {}
+        self.market = MarketAnalyzer(stocks_map, predictor=predictor, lookback_days=lookback_days, interval=interval,
+                                     complete_only=self.strategy == "ml")
         self.news = news_analyzer or NewsAnalyzer()
         self.learner = Learner(self.db)
         # Порог входа: 1.5 даёт сделки на спокойном рынке,
@@ -113,6 +130,11 @@ class TraderAgent:
         # SMA(regime_sma), шорты — только когда ниже. По умолчанию выключен:
         # агент торгует в обе стороны при любом рынке.
         self.regime_sma = regime_sma
+        # Свободные деньги считаем лежащими в фонде денежного рынка LQDT — как
+        # сделал бы любой реальный счёт. Доход виден отдельно от сделок.
+        self.cash_yield = cash_yield
+        self._lots: Dict[str, int] = {}
+        self._lots_day: Optional[str] = None
 
         self.on_trade_opened = on_trade_opened
         self.on_trade_closed = on_trade_closed
@@ -136,6 +158,8 @@ class TraderAgent:
         )
         try:
             tickers = scan_tickers or self._candidate_tickers()
+            if self.cash_yield:
+                self._accrue_cash_yield()
             signals = self.market.scan_universe(tickers)
             sentiment = self.market.market_sentiment(signals)
             news = self.news.assess(tickers=[s.ticker for s in signals])
@@ -168,6 +192,15 @@ class TraderAgent:
                     rationale=f"Не открываем новые: {reason}.",
                     factors={"sentiment": sentiment, "news": news.to_dict()},
                 )
+            elif self.ml is not None:
+                # 3. ML: кандидаты — самые уверенные прогнозы модели в обе стороны
+                already_open = {p["ticker"] for p in self.portfolio.open_positions()}
+                ml_candidates = self._ml_candidates(signals, already_open, allowed_sides)
+                if not ml_candidates:
+                    report.skipped.append({"reason": "у модели нет уверенных прогнозов"})
+                for sig, p_up, side, bar_time in ml_candidates[:3]:
+                    result = self._try_open_ml(sig, p_up, side, bar_time, news, sentiment)
+                    (report.opened if result.get("opened") else report.skipped).append(result)
             else:
                 # 3. Кандидаты в обе стороны; первыми — те, что быстрее дойдут до цели
                 already_open = {p["ticker"] for p in self.portfolio.open_positions()}
@@ -228,6 +261,13 @@ class TraderAgent:
 
     # ── Фильтры входа ────────────────────────────────────────────────────────
     @staticmethod
+    def signal_bar_ok(bar_start: datetime) -> bool:
+        """Часовая свеча, по закрытию которой можно входить: будни, начало с 9:00
+        до 17:00 по Москве (вход — в основную сессию). На таких свечах
+        считаются сигналы в бэктесте и обучалась ML-модель."""
+        return bar_start.weekday() < 5 and SESSION_OPEN.hour - 1 <= bar_start.hour < SESSION_CLOSE.hour
+
+    @staticmethod
     def _session_open(now_utc: Optional[datetime] = None) -> bool:
         """Идёт ли основная сессия: вне её цена — вчерашняя, а не рыночная.
         Праздники не учитываются: в такие дни просто не будет свежих свечей."""
@@ -251,6 +291,38 @@ class TraderAgent:
         if last > sma:
             return True, f"IMOEX {last:.0f} выше SMA{self.regime_sma} {sma:.0f} — только лонги"
         return False, f"IMOEX {last:.0f} ниже SMA{self.regime_sma} {sma:.0f} — только шорты"
+
+    # ── Данные MOEX: лоты и фонд для свободных денег ─────────────────────────
+    def _lot_size(self, ticker: str) -> int:
+        """Размер лота на TQBR; обновляется раз в день. Без данных — 1 акция."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        if self._lots_day != today:
+            try:
+                r = requests.get(
+                    "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json",
+                    params={"iss.meta": "off", "iss.only": "securities", "securities.columns": "SECID,LOTSIZE"},
+                    timeout=15,
+                )
+                self._lots = {secid: int(lot) for secid, lot in r.json()["securities"]["data"] if lot}
+                self._lots_day = today
+            except Exception as exc:
+                print(f"[TraderAgent] лоты MOEX недоступны: {exc}")
+        return self._lots.get(ticker, 1)
+
+    def _accrue_cash_yield(self) -> None:
+        """Начислить на свободный кэш доходность LQDT за прошедшие торговые дни."""
+        end = datetime.now()
+        for board in ("TQBR", "TQTF"):  # в 2026 году фонд переехал с TQTF на TQBR
+            try:
+                df = fetch_moex_data("LQDT", end - timedelta(days=10), end, 8, board=board)
+            except Exception:
+                continue
+            if df is not None and not df.empty:
+                last = df.iloc[-1]
+                accrued = self.portfolio.accrue_cash_yield(float(last["CLOSE"]), str(last["DATE"])[:10])
+                if accrued:
+                    print(f"[TraderAgent] доход LQDT на свободные деньги: {accrued:+.2f} ₽")
+                return
 
     # ── Кандидаты ────────────────────────────────────────────────────────────
     def _candidate_tickers(self) -> List[str]:
@@ -343,6 +415,7 @@ class TraderAgent:
             political_risk=news.political_risk,
             confidence=confidence,
             side=side,
+            lot=self._lot_size(sig.ticker),
         )
         if plan is None or plan.qty <= 0:
             self.db.log_decision(
@@ -360,9 +433,23 @@ class TraderAgent:
 
         # Горизонт сделки агент выбирает сам
         horizon_hours = self._choose_horizon(sig, confidence)
-        deadline_at = (datetime.utcnow() + timedelta(hours=horizon_hours)).isoformat(timespec="seconds")
-
         rationale = self._build_rationale(sig, plan, news, sentiment, horizon_hours, verdict)
+        return self._execute_open(sig, side, action, plan, confidence, risk_score, features, horizon_hours, rationale)
+
+    def _execute_open(
+        self,
+        sig: TickerSignal,
+        side: str,
+        action: str,
+        plan: TradePlan,
+        confidence: float,
+        risk_score: float,
+        features: Dict[str, Any],
+        horizon_hours: float,
+        rationale: str,
+    ) -> Dict[str, Any]:
+        """Записать решение, зарезервировать деньги и открыть сделку."""
+        deadline_at = (datetime.utcnow() + timedelta(hours=horizon_hours)).isoformat(timespec="seconds")
         decision_id = self.db.log_decision(
             ticker=sig.ticker,
             action=action,
@@ -409,6 +496,80 @@ class TraderAgent:
         self._safe_call(self.on_trade_opened, result)
         return result
 
+    # ── ML-стратегия ─────────────────────────────────────────────────────────
+    def _imoex_hourly(self) -> Optional[pd.DataFrame]:
+        end = datetime.now()
+        try:
+            df = fetch_stock_data_with_fallback("IMOEX", 0, end - timedelta(days=self.market.lookback_days),
+                                                end, self.market.interval)
+        except Exception as exc:
+            print(f"[TraderAgent] нет часовых свечей IMOEX: {exc}")
+            return None
+        if df is None or df.empty:
+            return None
+        return self.market.drop_incomplete(df).set_index("DATE")
+
+    def _ml_candidates(self, signals: List[TickerSignal], already_open: set, allowed_sides: set) -> List[tuple]:
+        """(сигнал, вероятность роста, сторона, свеча) — по убыванию уверенности модели.
+        На одну закрытую свечу бумаги — не больше одного входа, как в бэктесте."""
+        imoex = self._imoex_hourly()
+        if imoex is None:
+            return []
+        out = []
+        for sig in signals:
+            bars = self.market.frames.get(sig.ticker)
+            if sig.ticker in already_open or bars is None or len(bars) < 30:
+                continue
+            bars = bars.set_index("DATE")
+            bar_time = bars.index[-1]
+            if self._ml_used_bar.get(sig.ticker) == bar_time or not self.signal_bar_ok(bar_time):
+                continue
+            p_up = float(self.ml.prob_up(feature_row(sig, bars, imoex))[0])
+            side = self.ml.side(p_up)
+            if side in allowed_sides:
+                out.append((sig, p_up, side, bar_time))
+        out.sort(key=lambda c: abs(c[1] - 0.5), reverse=True)
+        return out
+
+    def _try_open_ml(
+        self,
+        sig: TickerSignal,
+        p_up: float,
+        side: str,
+        bar_time: Any,
+        news: NewsAssessment,
+        sentiment: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Вход по прогнозу модели. Размер и горизонт — как в проверенном бэктесте:
+        от силы сигнала индикаторов, без новостей, уроков и политического риска."""
+        self._ml_used_bar[sig.ticker] = bar_time
+        price = self.market.last_prices.get(sig.ticker, sig.price)  # текущая цена, а не закрытие прошлой свечи
+        confidence = max(0.0, min(1.0, abs(sig.score) / 6.0))
+        features = {**self._features_for(sig, news, sentiment), "ml_prob_up": round(p_up, 4),
+                    "ml_lo": self.ml.lo, "ml_hi": self.ml.hi, "ml_bar": str(bar_time)}
+        risk_score = self.risk.overall_risk_score(sig.score, news.political_risk, sig.volatility_annual)
+        plan = self.risk.plan_trade(
+            ticker=sig.ticker, price=price, atr_pct=sig.atr_pct, political_risk=0.0,
+            confidence=confidence, side=side, lot=self._lot_size(sig.ticker),
+        )
+        if plan is None or plan.qty <= 0:
+            self.db.log_decision(
+                ticker=sig.ticker, action="SKIP", confidence=confidence, risk_score=risk_score,
+                rationale="Риск-менеджер не разрешил вход: мало кэша или лимит экспозиции",
+                factors=features,
+            )
+            return {"opened": False, "ticker": sig.ticker, "reason": "no qty"}
+        horizon_hours = self._choose_horizon(sig, confidence)
+        threshold = f"лонг от {self.ml.hi:.2f}" if side == "LONG" else f"шорт до {self.ml.lo:.2f}"
+        rationale = (
+            f"{'Покупка' if side == 'LONG' else 'Шорт'} {plan.qty} {sig.ticker} @ {plan.entry_price:.2f} ₽. "
+            f"ML: вероятность роста за 6 ч — {p_up:.2f} ({threshold}). "
+            f"SL {plan.stop_loss:.2f} / TP {plan.take_profit:.2f} (риск {plan.risk_amount:.0f} ₽). "
+            f"Горизонт ≤ {horizon_hours:.0f} ч."
+        )
+        action = "BUY" if side == "LONG" else "SHORT"
+        return self._execute_open(sig, side, action, plan, confidence, risk_score, features, horizon_hours, rationale)
+
     def _choose_horizon(self, sig: TickerSignal, confidence: float) -> float:
         """Сам решает, в течение скольких часов хочет закрыть сделку (не дольше суток)."""
         base = 12.0
@@ -440,7 +601,9 @@ class TraderAgent:
             sig = signals_by_ticker.get(ticker) or self.market.analyze_ticker(ticker)
             if sig is None:
                 continue
-            price = sig.price
+            # Текущая цена: в ML-режиме сигнал считается по закрытой свече, а стоп
+            # и тейк должны проверяться по свежей цене
+            price = self.market.last_prices.get(ticker, sig.price)
             is_long = pos.get("side", "LONG") == "LONG"
             ticker_news = news.per_ticker.get(ticker, 0.0)
 
@@ -453,6 +616,9 @@ class TraderAgent:
                 deadline = self._parse_iso(pos["deadline_at"])
                 if deadline and now >= deadline:
                     reason = "TIMEOUT"
+                # ML-стратегия проверена только с выходами по стопу, тейку и времени
+                elif self.ml is not None:
+                    pass
                 # Жёсткая смена сигнала против позиции
                 elif (sig.direction == "SELL" and sig.score <= -2.5) if is_long else (sig.direction == "BUY" and sig.score >= 2.5):
                     reason = "SIGNAL_FLIP"

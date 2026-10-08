@@ -21,6 +21,7 @@ from app.data_services import fetch_stock_data_with_fallback
 log = logging.getLogger(__name__)
 
 DAILY_INTERVAL = 8           # код дневных свечей (см. app.config.INTERVALS)
+MOEX_DATA_DELAY_MIN = 15     # бесплатные данные MOEX ISS приходят с задержкой 15 минут
 TRADING_DAYS_PER_YEAR = 252
 SESSION_MINUTES_PER_DAY = 840  # ~14 часов: основная + вечерняя сессия MOEX
 
@@ -67,12 +68,27 @@ class MarketAnalyzer:
         predictor=None,
         lookback_days: int = 120,
         interval: int = DAILY_INTERVAL,
+        complete_only: bool = False,
     ):
-        """interval — таймфрейм свечей: 8 — дневные, иначе минуты (60 — часовые)."""
+        """interval — таймфрейм свечей: 8 — дневные, иначе минуты (60 — часовые).
+        complete_only — анализировать только закрытые внутридневные свечи
+        (как в бэктесте), с поправкой на 15-минутную задержку данных MOEX."""
         self.stocks_map = stocks_map
         self.lookback_days = lookback_days
         self.predictor = predictor
         self.interval = interval
+        self.complete_only = complete_only
+        self.frames: Dict[str, pd.DataFrame] = {}  # последние загруженные свечи по бумагам
+        self.last_prices: Dict[str, float] = {}    # текущая цена, включая незакрытую свечу
+
+    def drop_incomplete(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Убрать ещё не закрытые свечи. Бесплатные данные MOEX опаздывают на
+        15 минут, поэтому свеча считается закрытой через 15 минут после конца."""
+        if not self.complete_only or self.interval in (DAILY_INTERVAL, 9, 10, 11) or df.empty:
+            return df
+        now_msk = datetime.utcnow() + timedelta(hours=3)
+        closed_before = now_msk - timedelta(minutes=self.interval + MOEX_DATA_DELAY_MIN)
+        return df[pd.to_datetime(df["DATE"]) <= closed_before].reset_index(drop=True)
 
     # ── Загрузка ──────────────────────────────────────────────────────────────
     def load_candles(self, ticker: str) -> Optional[pd.DataFrame]:
@@ -113,6 +129,11 @@ class MarketAnalyzer:
     def analyze_ticker(self, ticker: str, df: Optional[pd.DataFrame] = None) -> Optional[TickerSignal]:
         if df is None:
             df = self.load_candles(ticker)
+            if df is not None:
+                if not df.empty:
+                    self.last_prices[ticker] = float(df["CLOSE"].iloc[-1])
+                df = self.drop_incomplete(df)
+                self.frames[ticker] = df
         if df is None or df.empty or len(df) < 20:
             return None
 

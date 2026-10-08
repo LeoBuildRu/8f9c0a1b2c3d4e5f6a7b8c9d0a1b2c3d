@@ -76,18 +76,22 @@ async def _serve() -> None:
     )
     news_analyzer = NewsAnalyzer(path=str(config.NEWS_FILE))
 
-    # ML-прогноз выключен: MarketAnalyzer отдаёт в PricePredictor свечи вместе
-    # со своими индикаторами, из-за SMA50 модели не хватает строк для оценки
-    # точности, и агент прогноз игнорирует. Пока это не исправлено и польза ML
-    # не проверена в backtest.py, обучение моделей на каждом тике — пустая
-    # трата CPU маленького VPS.
+    # Старый PricePredictor (ollama_worker) не используется: входы решает
+    # LightGBM из data/models (стратегия "ml"), проверенный в research/.
     agent = TraderAgent(
         stocks_map=STOCKS,
         predictor=None,
+        strategy=config.STRATEGY,
+        cash_yield=config.CASH_YIELD,
         capital_limit=config.CAPITAL_LIMIT,
         db_path=str(config.DB_PATH),
         news_analyzer=news_analyzer,
     )
+    if agent.ml is not None:
+        log.info("Стратегия: ML (обучена до %s, пороги %.3f / %.3f)",
+                 agent.ml.meta.get("trained_until"), agent.ml.lo, agent.ml.hi)
+    else:
+        log.info("Стратегия: индикаторы")
 
     bot = TelegramBot(
         token=config.TELEGRAM_TOKEN,

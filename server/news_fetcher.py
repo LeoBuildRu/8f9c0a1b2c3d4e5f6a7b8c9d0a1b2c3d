@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 
 
 class TelegramNewsFetcher:
+    MAX_GAP_PAGES = 20  # догрузка пропуска: до ~400 постов за раз
+
     def __init__(
         self,
         http: HttpClient,
@@ -61,26 +63,48 @@ class TelegramNewsFetcher:
             encoding="utf-8",
         )
 
-    def fetch(self) -> int:
-        """Скачивает страницу канала, добавляет новые записи в JSON. Возвращает кол-во новых."""
+    def _get_html(self, url: str) -> Optional[str]:
         if self.proxy_url:
-            html = self._fetch_via_dedicated_proxy()
-        else:
-            resp = self.http.get(self.url)
-            html = resp.text if resp is not None and resp.status_code == 200 else None
+            return self._fetch_via_dedicated_proxy(url)
+        resp = self.http.get(url)
+        return resp.text if resp is not None and resp.status_code == 200 else None
 
-        if not html:
-            log.warning("Не удалось загрузить %s", self.url)
-            return 0
+    @staticmethod
+    def _post_id(link: str) -> Optional[int]:
+        m = re.search(r"/(\d+)$", link or "")
+        return int(m.group(1)) if m else None
 
-        soup = BeautifulSoup(html, "html.parser")
-        messages = soup.select(".tgme_widget_message")
+    def fetch(self) -> int:
+        """Скачивает новые посты канала в JSON. Возвращает кол-во новых.
+
+        Первая страница веб-версии — только ~20 последних постов. Если с прошлой
+        загрузки вышло больше (всплеск новостей, простой сервера), догружаем
+        страницы ?before=<номер>, пока не дойдём до уже сохранённого поста.
+        """
+        existing = self.load()
+        existing_links = {n.get("link") for n in existing if n.get("link")}
+        known_ids = [i for i in (self._post_id(link) for link in existing_links) if i]
+        last_known = max(known_ids) if known_ids else None
+
+        messages = []
+        url = self.url
+        for page in range(self.MAX_GAP_PAGES):
+            html = self._get_html(url)
+            if not html:
+                log.warning("Не удалось загрузить %s", url)
+                break
+            page_msgs = BeautifulSoup(html, "html.parser").select(".tgme_widget_message[data-post]")
+            if not page_msgs:
+                break
+            messages.extend(page_msgs)
+            oldest = min(int(m["data-post"].rsplit("/", 1)[-1]) for m in page_msgs)
+            if last_known is None or oldest <= last_known + 1:
+                break
+            url = f"{self.url}?before={oldest}"
+            time.sleep(1.0 + random.random())
         if not messages:
             log.info("Сообщений не найдено на %s", self.url)
             return 0
-
-        existing = self.load()
-        existing_links = {n.get("link") for n in existing if n.get("link")}
 
         new_items: List[Dict[str, Any]] = []
         for msg in messages:
@@ -101,6 +125,7 @@ class TelegramNewsFetcher:
             formatted = self._format_dt(raw_dt)
 
             new_items.append({
+                "id": self._post_id(link),
                 "text": re.sub(r"\s+\n", "\n", text),
                 "date": formatted,
                 "link": link,
@@ -109,9 +134,9 @@ class TelegramNewsFetcher:
             existing_links.add(link)
 
         if new_items:
-            merged = existing + new_items
-            # Сохраняем не больше 5000 свежих, чтобы файл не разрастался
-            merged = merged[-5000:]
+            merged = sorted(existing + new_items, key=lambda n: self._post_id(n.get("link")) or 0)
+            # Храним последние 20 000 постов (~2 года канала), чтобы файл не разрастался
+            merged = merged[-20000:]
             self.save(merged)
 
         # Показываем диапазон дат сообщений, попавших в выдачу.
@@ -136,7 +161,7 @@ class TelegramNewsFetcher:
         return len(new_items)
 
     # ── Выделенный прокси для t.me ───────────────────────────────────────────
-    def _fetch_via_dedicated_proxy(self) -> Optional[str]:
+    def _fetch_via_dedicated_proxy(self, url: str) -> Optional[str]:
         """Запрос через тот же SOCKS5, что использует Telegram-бот.
 
         UA ротатируется через общий ProxyPool, чтобы запросы выглядели
@@ -159,7 +184,7 @@ class TelegramNewsFetcher:
             }
             try:
                 resp = requests.get(
-                    self.url,
+                    url,
                     headers=headers,
                     proxies=proxies,
                     timeout=self.timeout,
