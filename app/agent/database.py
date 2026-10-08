@@ -109,6 +109,13 @@ CREATE TABLE IF NOT EXISTS subscribers (
     is_admin    INTEGER NOT NULL DEFAULT 1,
     enabled     INTEGER NOT NULL DEFAULT 1
 );
+
+-- Служебные значения агента: последняя учтённая цена LQDT, доход на кэше и т. п.
+CREATE TABLE IF NOT EXISTS kv (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 """
 
 
@@ -164,6 +171,19 @@ class AgentDB:
             c.execute(
                 "UPDATE portfolio SET cash = ?, updated_at = ? WHERE id = 1",
                 (cash, _now()),
+            )
+
+    def get_kv(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        with self._conn() as c:
+            row = c.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else default
+
+    def set_kv(self, key: str, value: Any) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                (key, str(value), _now()),
             )
 
     def reset(self) -> None:

@@ -6,6 +6,8 @@ pandas==2.3.3
 numpy==2.2.6
 pandas-ta==0.4.71b0
 scikit-learn==1.7.2
+# ML-стратегия: прогноз LightGBM (нужен системный libgomp1 — ставит install.sh)
+lightgbm==4.7.0
 fake-useragent==2.2.0
 python-telegram-bot[socks]==20.7
 httpx[socks]==0.25.2

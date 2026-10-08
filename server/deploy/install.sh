@@ -20,7 +20,7 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 apt-get update
-apt-get install -y python3 python3-venv rsync
+apt-get install -y python3 python3-venv rsync libgomp1
 
 # Подкачка: на VPS с 1 ГБ памяти pandas + sklearn легко упираются в OOM
 mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
@@ -73,9 +73,13 @@ fi
 # systemd: агент и дашборд (дашборд слушает только 127.0.0.1, открывается через SSH-туннель)
 cp "$TARGET_DIR/server/deploy/leoagent.service" /etc/systemd/system/leoagent.service
 cp "$TARGET_DIR/server/deploy/leoagent-dashboard.service" /etc/systemd/system/leoagent-dashboard.service
+# Ежемесячное переобучение ML-модели (нужна среда /root/research/.venv-ml)
+cp "$TARGET_DIR/server/deploy/leoagent-retrain.service" /etc/systemd/system/leoagent-retrain.service
+cp "$TARGET_DIR/server/deploy/leoagent-retrain.timer" /etc/systemd/system/leoagent-retrain.timer
 systemctl daemon-reload
-systemctl enable leoagent leoagent-dashboard
+systemctl enable leoagent leoagent-dashboard leoagent-retrain.timer
 systemctl restart leoagent-dashboard
+systemctl start leoagent-retrain.timer
 
 echo ""
 echo "Готово. Дальше:"
