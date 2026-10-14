@@ -35,10 +35,7 @@ AGENT_CAPITAL_LIMIT = 1_000_000.0
 # Топ-25 ликвидных эмитентов — широкий, но всё ещё качественный пул.
 # На нём же проверяется стратегия в backtest.py.
 PRIORITY_TICKERS = [
-    "SBER", "GAZP", "LKOH", "ROSN", "NVTK", "GMKN", "PLZL", "TATN",
-    "MGNT", "T", "MOEX", "ALRS", "CHMF", "MTSS", "YDEX",
-    "RUAL", "AFKS", "PHOR", "OZON", "VTBR", "IRAO", "AFLT",
-    "SNGS", "HYDR", "RTKM",
+    "VKCO", "AFLT", "OZON", "HYDR", "RTKM", "PLZL", "SNGSP", "SNGS", "SVCB",
 ]
 
 # Основная сессия MOEX по Москве (UTC+3, без перехода на летнее время)

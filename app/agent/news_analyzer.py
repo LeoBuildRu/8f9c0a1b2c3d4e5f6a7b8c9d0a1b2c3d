@@ -54,6 +54,7 @@ TICKER_ALIASES: Dict[str, List[str]] = {
     "NVTK": ["новатэк", "novatek"],
     "TATN": ["татнефть", "tatneft"],
     "SNGS": ["сургутнефтегаз", "surgut"],
+    "SNGSP": ["сургутнефтегаз преф", "сургут преф", "sngsp"],
     "BANE": ["башнефть", "bashneft"],
     "TRNFP": ["транснефть", "transneft"],
     # Банки и финансы
